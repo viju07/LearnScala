@@ -1,0 +1,100 @@
+package com.amo.spark.dps.cdp
+
+import scala.collection.mutable.ListBuffer
+import scala.util.Failure
+import scala.util.Random
+import scala.util.Success
+import scala.util.Try
+import org.apache.spark.SparkConf
+import org.apache.spark.SparkContext
+import org.apache.spark.sql.Row
+import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql.SaveMode
+import org.apache.spark.sql.types.IntegerType
+import org.apache.spark.sql.types.StringType
+import org.apache.spark.sql.types.StructField
+import org.apache.spark.sql.types.StructType
+import org.slf4j.LoggerFactory
+import com.amo.spark.common.util.Parsing
+import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.module.scala.DefaultScalaModule
+
+object TelcoDataGenerator {
+
+  def main(args: Array[String]) {
+    val APP_NAME: String = getClass.getSimpleName.dropRight(1)
+    val logger = LoggerFactory.getLogger(APP_NAME)
+    val conf = new SparkConf().setAppName(APP_NAME)
+    val sc = new SparkContext(conf)
+    val sqlContext = new SQLContext(sc)
+    val defaultConfigFilePath = args(0)
+    val objectMapper = new ObjectMapper()
+    objectMapper.registerModule(DefaultScalaModule)
+
+    /* reading json file*/
+    val jsonKV = objectMapper.readValue(sc.textFile(args(0)).collect().mkString(Parsing.NEWLINE), classOf[Map[String, Any]])
+    val MAX_LENGTH = "maxLength"
+    val NULLABLE = "Nullable"
+    val TYPE = "type"
+    val FILE_SIZE = "fileSize_In_MB"
+    val COLUMN_DETAILS = "colDetails"
+    val columnDetails = jsonKV.get(COLUMN_DETAILS).get.asInstanceOf[Map[String, Map[String, String]]]
+    val TARGET_PATH = jsonKV.get("target_path").get.toString()
+    val random = new Random()
+    var rows = ListBuffer[Row]()
+    var structField = ListBuffer[StructField]()
+  
+    /*creating schema */
+    Try {
+      for ((k, v) <- columnDetails) {
+        structField += StructField(k,
+          v.get(TYPE).get.toUpperCase() match {
+            case "STRING"  => StringType
+            case "INTEGER" => IntegerType
+            case _         => StringType
+          }, v.get(NULLABLE).get.toBoolean)
+      }
+    } match {
+      case Success(_) => logger.info(s"===>> Schema created ${structField.toList}")
+      case Failure(e) => logger.error(s"===>> Unable to create schema:- ${e.getMessage}")
+    }
+
+    val SRC_SCHEMA = StructType(structField.toList)
+    val fileSize = jsonKV.get(FILE_SIZE).get.toString().toInt
+    val columnCount = columnDetails.size + 1
+    val noOfRecords = Math.round((fileSize / columnCount) * 500000)
+    if (noOfRecords == 0) {
+      logger.error(s"===>> Unable to generate data please increase file size more than $columnCount MB")
+      System.exit(0)
+    }
+    
+    /*data generating */
+    Try {
+      for (i <- 1 to noOfRecords) {
+        var dataSet = new ListBuffer[Any]()
+        for ((k, v) <- columnDetails) {
+          if (v.contains("values")) {
+            val valArray = v.get("values").get.asInstanceOf[List[String]]
+             v.get("type").get.toUpperCase() match {
+               case "INTEGER"      => dataSet += valArray(random.nextInt(valArray.length)).toInt
+               case "STRING"       => dataSet += valArray(random.nextInt(valArray.length))
+            }
+          } else {
+            v.get("type").get.toUpperCase() match {
+              case "INTEGER"      => dataSet += random.nextInt(v.get(MAX_LENGTH).get.toInt)
+              case "STRING"       => dataSet += random.nextString(v.get(MAX_LENGTH).get.toInt)
+              case "ALPHANUMERIC" => dataSet += random.alphanumeric.take(v.get(MAX_LENGTH).get.toInt).mkString("")
+            }
+          }
+        }
+        rows += Row.fromSeq(dataSet.toSeq)
+      }
+      val dataDF = sqlContext.createDataFrame(sqlContext.sparkContext.parallelize(rows), SRC_SCHEMA)
+      dataDF.write.mode(SaveMode.Append).parquet(TARGET_PATH)
+    } match {
+      case Success(_) => logger.info(s"===>> Data generated succefully at ${TARGET_PATH}")
+      case Failure(e) => logger.error(s"===>> Unable to generate data:- $e")
+    }
+
+  }
+}
